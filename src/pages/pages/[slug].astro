@@ -1,0 +1,121 @@
+---
+import { ptComponents } from "../../diver/pt";
+import { getEmDashEntry, getSeoMeta, decodeSlug } from "emdash";
+import { PortableText } from "emdash/ui";
+import Layout from "../../diver/Layout.astro";
+import Breadcrumb from "../../diver/Breadcrumb.astro";
+import { SITE, slugCandidates, slugUrl, COURSE_ORDER } from "../../diver/site";
+import { Image } from "emdash/ui";
+import { checkAccess, pageLevel } from "../../diver/access";
+
+const slug = decodeSlug(Astro.params.slug);
+if (!slug) return Astro.rewrite("/404");
+
+// 下書きのプレビュー（?_preview=…）は転送せず、キャッシュもしない
+const isPreview = Astro.url.searchParams.has("_preview");
+if (isPreview && Astro.cache?.enabled) Astro.cache.set(false);
+
+let page: any = null;
+let cacheHint: any;
+let stored = slug;
+for (const s of slugCandidates(slug)) {
+	const r = await getEmDashEntry("pages", s);
+	if (r.entry) { page = r.entry; cacheHint = r.cacheHint; stored = s; break; }
+}
+if (!page) return Astro.rewrite("/404");
+
+if (!isPreview && Astro.originPathname.startsWith("/pages/")) {
+	return Astro.redirect(slugUrl(stored), 301);
+}
+// 会員限定のページ: 見られる人だけに本文を出す。見た人によって中身が変わるので、保存（キャッシュ）しない
+const restricted = pageLevel(page.data) !== null;
+const access = restricted ? await checkAccess(page.data, Astro.locals.user) : { allowed: true as const };
+let sorry: any = null;
+if (restricted) {
+	if (Astro.cache?.enabled) Astro.cache.set(false);
+	Astro.response.headers.set("Cache-Control", "private, no-store");
+	if (!access.allowed) sorry = (await getEmDashEntry("pages", (SITE as any).sorryPage ?? "sorry")).entry;
+} else if (!isPreview && Astro.cache?.enabled) Astro.cache.set(cacheHint);
+
+// 講習のページ: 決まった順番（site.ts の COURSE_ORDER）で「次はこのページへ」（カード）と「前のページ」を出す
+let next: { href: string; title: string; image: any; label: string } | null = null;
+let prev: { href: string; title: string } | null = null;
+if (restricted && access.allowed) {
+	const order: string[] = (SITE as any).courseOrder ?? COURSE_ORDER;
+	const i = order.findIndex((s) => s === stored || s === slug || decodeURIComponent(s) === slug);
+	const find = async (from: number, step: number) => {
+		for (let j = from; j >= 0 && j < order.length; j += step) {
+			const { entry } = await getEmDashEntry("pages", order[j]);
+			if (entry && pageLevel(entry.data) !== null) return { entry, s: order[j] };
+		}
+		return null;
+	};
+	if (i >= 0) {
+		const f = await find(i + 1, 1);
+		if (f) {
+			const n = f.entry;
+			const lv = pageLevel(n.data);
+			const here = pageLevel(page.data);
+			next = {
+				href: slugUrl(f.s),
+				title: n.data.title,
+				image: n.data.featured_image ?? null,
+				label: lv === here ? `次は「${n.data.title}」に進みましょう` : `Level.${here} はここまでです。次は Level.${lv} の「${n.data.title}」に進みましょう`,
+			};
+		}
+		const b = i > 0 ? await find(i - 1, -1) : null;
+		if (b) prev = { href: slugUrl(b.s), title: b.entry.data.title };
+	}
+}
+
+const seo = getSeoMeta(page, { siteTitle: SITE.title, siteUrl: Astro.url.origin, path: slugUrl(stored) });
+---
+
+<Layout
+	title={page.data.title}
+	description={seo.description}
+	canonical={seo.canonical}
+	robots={restricted ? "noindex, nofollow" : seo.robots}
+	content={{ collection: "pages", id: page.data.id, slug }}
+>
+	<Breadcrumb items={[{ label: page.data.title }]} />
+	<article class="d-card d-page">
+		<h1 class="d-article__title" {...page.edit.title}>{page.data.title}</h1>
+		{
+			access.allowed ? (
+				<div class="d-content" {...page.edit.content}>
+					<PortableText value={page.data.content} components={ptComponents} />
+					{next && (
+						<div class="d-next">
+							<p class="d-next__label">{next.label}</p>
+							<a href={next.href} class="d-linkcard">
+								{next.image && (
+									<span class="d-linkcard__thumb">
+										{next.image.provider === "external" && next.image.src ? <img src={next.image.src} alt="" loading="lazy" /> : <Image image={next.image} sizes="240px" />}
+									</span>
+								)}
+								<span class="d-linkcard__body">
+									<span class="d-linkcard__title">{next.title}</span>
+									<span class="d-linkcard__site">次のページへ進む →</span>
+								</span>
+							</a>
+						</div>
+					)}
+					{prev && <p class="d-prev"><a href={prev.href}>← 前のページ：{prev.title}</a></p>}
+				</div>
+			) : (
+				<div class="d-content d-members-only">
+					<p class="d-members-only__note">
+						{access.reason === "login"
+							? `このページは会員（Level.${access.level}）向けです。会員の方はログインしてからご覧ください。`
+							: `このページは Level.${access.level} の会員向けです。まだこのレベルは開いていません。`}
+					</p>
+					{access.reason === "login" && (
+						<p><a class="d-members-only__login" href={`/_emdash/admin/login?redirect=${encodeURIComponent(Astro.url.pathname)}`}>会員ログイン（メールでログインのリンクが届きます）</a></p>
+					)}
+					{sorry && <PortableText value={sorry.data.content} components={ptComponents} />}
+				</div>
+			)
+		}
+	</article>
+</Layout>
